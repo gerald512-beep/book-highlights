@@ -1,0 +1,510 @@
+﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+prepublish.py (rebuilt, focused)
+--------------------------------
+Prepare Instagram/Facebook-ready quote images and one caption file per run.
+
+What this version does (clean and minimal):
+- Lets you pick a book from Postgres (books + quotes tables).
+- Allows selecting which quotes to generate (by numbers).
+- Renders images using PIL with blurred-cover background.
+- Creates two CTA images (IG and FB) with rotated texts.
+- Generates a single caption file ending with "-caption.txt" using a minimal LLM prompt
+  (or leaves it empty if the LLM is disabled or fails).
+- Records generated images in `generated_images` if the table exists.
+
+Environment:
+  DATABASE_URL, PREPUBLISH_USE_LLM=openai, OPENAI_API_KEY (optional)
+"""
+
+from __future__ import annotations
+
+import os
+import io
+import re
+import json
+import time
+import hashlib as _h
+import pathlib
+from typing import List, Tuple, Optional, Dict
+
+from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import requests
+
+
+# ---------------- UI + Layout constants ----------------
+PAGE_SIZE = 10
+CANVAS_W, CANVAS_H = 1080, 1350
+MARGIN = 64
+LINE_SPACING = 0.94
+QUOTE_COLOR = (20, 20, 20)
+META_COLOR = (40, 40, 40)
+BRAND_COLOR = (90, 90, 90)
+CARD_BG = (255, 255, 255)
+OVERLAY_TINT = (255, 255, 255, 210)
+DEFAULT_HASHTAGS = "#Bookstagram #MissedPages #CommissionsEarned"
+DEFAULT_IMAGES_PER_BOOK = 3
+BRAND_HANDLE = "@Missed.Pages.Book"
+
+DEFAULT_TEXT_FONT = r"C:\\Windows\\Fonts\\georgia.ttf"
+DEFAULT_TITLE_FONT = r"C:\\Windows\\Fonts\\georgiab.ttf"
+DEFAULT_QUOTE_FONT = r"C:\\Windows\\Fonts\\georgia.ttf"
+
+# Holds the most recent raw caption body returned by the LLM (for debugging)
+LLM_LAST_OUTPUT: List[str] = []
+
+
+# ---------------- Utilities ----------------
+def slugify(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode("ascii")
+    s = "".join(c if c.isalnum() else "-" for c in s.lower())
+    while "--" in s:
+        s = s.replace("--", "-")
+    return s.strip("-") or "post"
+
+
+def shortkey(text: str) -> str:
+    return _h.md5((text or "").encode("utf-8")).hexdigest()[:8]
+
+
+def load_font(path: Optional[str], size: int) -> ImageFont.FreeTypeFont:
+    try:
+        if path and os.path.exists(path):
+            return ImageFont.truetype(path, size)
+        candidates = [
+            path,
+            "C:\\Windows\\Fonts\\arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "arial.ttf",
+        ]
+        for p in candidates:
+            try:
+                if p and os.path.exists(p):
+                    return ImageFont.truetype(p, size)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ImageFont.load_default()
+
+
+def load_image_from_url(url: str, timeout=20) -> Optional[Image.Image]:
+    if not url:
+        return None
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "prepublish/1.0"})
+        r.raise_for_status()
+        return Image.open(io.BytesIO(r.content)).convert("RGB")
+    except Exception:
+        return None
+
+
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
+    words = (text or "").strip().split()
+    if not words:
+        return ""
+    lines, line = [], []
+    for w in words:
+        t = (" ".join(line + [w])) if line else w
+        if draw.textlength(t, font=font) <= max_width:
+            line.append(w)
+        else:
+            if line:
+                lines.append(" ".join(line))
+            line = [w]
+    if line:
+        lines.append(" ".join(line))
+    return "\n".join(lines)
+
+
+def autosize_wrap(draw, text, font_path, min_size, max_size, max_width, max_lines=None):
+    size = max_size
+    while size >= min_size:
+        f = load_font(font_path, size)
+        wrapped = wrap_text(draw, text, f, max_width)
+        lines = [ln for ln in wrapped.split("\n") if ln]
+        ok = all(draw.textlength(ln, font=f) <= max_width for ln in lines)
+        if ok and (max_lines is None or len(lines) <= max_lines):
+            return f, wrapped
+        size -= 2
+    f = load_font(font_path, min_size)
+    return f, wrap_text(draw, text, f, max_width)
+
+
+def compose_background(cover: Optional[Image.Image]) -> Image.Image:
+    canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), CARD_BG)
+    if cover is None:
+        return canvas
+    aspect = cover.width / max(1, cover.height)
+    target = CANVAS_W / CANVAS_H
+    if aspect > target:
+        new_h = CANVAS_H
+        new_w = int(aspect * new_h)
+    else:
+        new_w = CANVAS_W
+        new_h = int(new_w / max(aspect, 1e-6))
+    resized = cover.resize((new_w, new_h), Image.LANCZOS)
+    x = (CANVAS_W - new_w) // 2
+    y = (CANVAS_H - new_h) // 2
+    canvas.paste(resized, (x, y))
+    canvas = canvas.filter(ImageFilter.GaussianBlur(12))
+    overlay = Image.new("RGBA", (CANVAS_W, CANVAS_H), OVERLAY_TINT)
+    return Image.alpha_composite(canvas.convert("RGBA"), overlay).convert("RGB")
+
+
+def strip_outer_double_quotes(s: str) -> str:
+    if not s:
+        return ""
+    s = s.strip()
+    while s.startswith(('"', 'â€œ')) and s.endswith(('"', 'â€')) and len(s) >= 2:
+        s = s[1:-1].strip()
+    return s
+
+
+def make_image(quote_text: str, title: str, author: str, cover_url: Optional[str], out_path: str) -> str:
+    cover = load_image_from_url(cover_url) if cover_url else None
+    canvas = compose_background(cover)
+    draw = ImageDraw.Draw(canvas)
+
+    x0, y0 = MARGIN, MARGIN
+    x1, y1 = CANVAS_W - MARGIN, CANVAS_H - MARGIN
+    footer_h = 60
+    meta_block_h = 140
+
+    quote_box = (x0, y0, x1, y1 - meta_block_h - footer_h - 24)
+    meta_box = (x0, y1 - meta_block_h - footer_h, x1, y1 - footer_h)
+
+    clean = strip_outer_double_quotes(quote_text or "")
+    wrapped_q = f'"{clean}"' if clean else ""
+    qfont, wrapped = autosize_wrap(draw, wrapped_q, DEFAULT_QUOTE_FONT, 34, 64, quote_box[2] - quote_box[0], 10)
+    lines = [ln for ln in wrapped.split("\n") if ln]
+    if lines:
+        total_h = len(lines) * int(qfont.size * LINE_SPACING)
+        y = quote_box[1] + ((quote_box[3] - quote_box[1]) - total_h) / 2
+        for ln in lines:
+            w = draw.textlength(ln, font=qfont)
+            x = quote_box[0] + ((quote_box[2] - quote_box[0]) - w) / 2
+            draw.text((x, y), ln, font=qfont, fill=QUOTE_COLOR)
+            y += int(qfont.size * LINE_SPACING)
+
+    # Meta
+    tfont, twrapped = autosize_wrap(draw, (title or "").strip(), DEFAULT_TEXT_FONT, 24, 36, meta_box[2] - meta_box[0], 2)
+    afont = load_font(DEFAULT_TITLE_FONT, max(20, int(tfont.size * 0.9)))
+    tx, ty = meta_box[0], meta_box[1]
+    for ln in [ln for ln in twrapped.split("\n") if ln]:
+        draw.text((tx, ty), ln, font=tfont, fill=META_COLOR); ty += int(tfont.size * LINE_SPACING)
+    author_text = (author or "").strip()
+    if author_text:
+        for ln in wrap_text(draw, author_text, afont, meta_box[2] - meta_box[0]).split("\n"):
+            draw.text((tx, ty), ln, font=afont, fill=BRAND_COLOR); ty += int(afont.size * LINE_SPACING)
+
+    ffont = load_font(DEFAULT_TEXT_FONT, 28)
+    brand_text = BRAND_HANDLE
+    w = draw.textlength(brand_text, font=ffont)
+    draw.text((CANVAS_W - MARGIN - w, CANVAS_H - MARGIN - 34), brand_text, font=ffont, fill=BRAND_COLOR)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.save(out_path, format="PNG", optimize=True)
+    return out_path
+
+
+def make_cta_image(cta_text: str, cover_url: Optional[str], out_path: str) -> str:
+    cover = load_image_from_url(cover_url) if cover_url else None
+    canvas = compose_background(cover)
+    draw = ImageDraw.Draw(canvas)
+    x0, y0 = MARGIN, MARGIN
+    x1, y1 = CANVAS_W - MARGIN, CANVAS_H - MARGIN
+    footer_h = 60
+    cta_box = (x0, y0, x1, y1 - footer_h)
+    qfont, wrapped = autosize_wrap(draw, (cta_text or "").strip(), DEFAULT_QUOTE_FONT, 34, 64, cta_box[2] - cta_box[0], 10)
+    lines = [ln for ln in wrapped.split("\n") if ln]
+    if lines:
+        total_h = len(lines) * int(qfont.size * LINE_SPACING)
+        y = cta_box[1] + ((cta_box[3] - cta_box[1]) - total_h) / 2
+        for ln in lines:
+            w = draw.textlength(ln, font=qfont)
+            x = cta_box[0] + ((cta_box[2] - cta_box[0]) - w) / 2
+            draw.text((x, y), ln, font=qfont, fill=QUOTE_COLOR)
+            y += int(qfont.size * LINE_SPACING)
+    ffont = load_font(DEFAULT_TEXT_FONT, 28)
+    brand_text = BRAND_HANDLE
+    bw = draw.textlength(brand_text, font=ffont)
+    draw.text((CANVAS_W - MARGIN - bw, CANVAS_H - MARGIN - 34), brand_text, font=ffont, fill=BRAND_COLOR)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.save(out_path, format="PNG", optimize=True)
+    return out_path
+
+
+# ---------------- LLM (minimal caption body) ----------------
+def _llm_provider_enabled() -> bool:
+    return (os.getenv("PREPUBLISH_USE_LLM", "").strip().lower() == "openai") and bool(os.getenv("OPENAI_API_KEY"))
+
+
+def _sanitize_no_dashes(text: str) -> str:
+    t = (text or "")
+    t = t.replace("â€”", ", ").replace("â€“", ", ").replace("-", ", ")
+    t = re.sub(r"\s+,\s+", ", ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _llm_api_key() -> Optional[str]:
+    return os.getenv("OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY")
+
+
+def generate_caption_body_llm_simple(title: str, author: str, out_dir: str, isbn: str = "") -> Optional[str]:
+    if not _llm_provider_enabled():
+        return None
+    api_key = _llm_api_key()
+    if not api_key:
+        return None
+    prompt = (
+        f"In a text between 400 and 500 characters, write a text to explain why reading the book {title or ''} by {author or ''}"
+        + (f" (ISBN {isbn})" if isbn else "")
+        + " is a good time investment. This text (your text) will be in this caption text of an image. "
+        "Do not use hyphens or dashes of any kind ('-', 'â€“', 'â€”'); prefer commas or periods."
+    )
+    try:
+        cache_dir = pathlib.Path(out_dir) / ".cache"; cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        cache_dir = pathlib.Path(".")
+    key = _h.md5(prompt.encode("utf-8")).hexdigest()
+    cache_file = cache_dir / f"caption-simple-{key}.txt"
+    if cache_file.exists():
+        try:
+            body = cache_file.read_text(encoding="utf-8").strip()
+            LLM_LAST_OUTPUT.clear(); LLM_LAST_OUTPUT.append(body)
+            return _sanitize_no_dashes(body)
+        except Exception:
+            pass
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 600,
+        "n": 1,
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        text = (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        LLM_LAST_OUTPUT.clear(); LLM_LAST_OUTPUT.append(text)
+        clean = _sanitize_no_dashes(text)
+        try:
+            cache_file.write_text(clean, encoding="utf-8")
+        except Exception:
+            pass
+        return clean
+    except Exception:
+        return None
+
+
+# ---------------- DB helpers ----------------
+def _connect(db_url: str):
+    import psycopg
+    return psycopg.connect(db_url)
+
+
+def list_books(conn) -> List[Tuple[str, str, str, str, int]]:
+    """Return [(book_id, title, author, cover_url, quotes_count)]"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select b.book_id, b.title, b.author_primary, b.cover_url, count(q.*) as quotes
+            from books b
+            left join quotes q on q.book_id=b.book_id
+            group by b.book_id, b.title, b.author_primary, b.cover_url
+            having count(q.*) > 0
+            order by b.title
+            limit 100
+            """
+        )
+        return [(r[0], r[1] or "", r[2] or "", r[3] or "", int(r[4] or 0)) for r in cur.fetchall()]
+
+
+def fetch_quotes_for_book(conn, book_id: str) -> List[Tuple[str, str]]:
+    with conn.cursor() as cur:
+        try:
+            cur.execute("select quote_id, quote_text from quotes where book_id=%s and coalesce(is_discarded,false)=false order by created_at asc", (book_id,))
+        except Exception:
+            cur.execute("select quote_id, quote_text from quotes where book_id=%s order by created_at asc", (book_id,))
+        return [(r[0], r[1] or "") for r in cur.fetchall()]
+
+
+def mark_flags(conn, gens: List[str], discs: List[str]):
+    with conn.cursor() as cur:
+        for qid in gens:
+            try:
+                cur.execute("update quotes set is_drafted=true, drafted_at=now() where quote_id=%s", (qid,))
+            except Exception:
+                pass
+        for qid in discs:
+            try:
+                cur.execute("update quotes set is_discarded=true, discarded_at=now() where quote_id=%s", (qid,))
+            except Exception:
+                pass
+        conn.commit()
+
+
+def record_generated_image(conn, book_id: str, quote_id: Optional[str], run_key: str, file_path: str):
+    try:
+        with conn.cursor() as cur:
+            fhash = None
+            try:
+                with open(file_path, 'rb') as fh:
+                    fhash = _h.md5(fh.read()).hexdigest()
+            except Exception:
+                pass
+            cur.execute(
+                """
+                insert into generated_images (book_id, quote_id, is_cta, run_key, file_path, width, height, file_hash)
+                values (%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (book_id, quote_id, quote_id is None, run_key, file_path, CANVAS_W, CANVAS_H, fhash),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+# ---------------- CLI helpers ----------------
+def pick_from_list(items: List[Tuple[str, str, str, str, int]]) -> Tuple[str, str, str, str]:
+    print("Available books (first 100 with quotes):")
+    for i, (_, title, author, _, qn) in enumerate(items, start=1):
+        print(f" {i:2d}. {title} - {author} | quotes: {qn}")
+    while True:
+        val = input("Select a number (or 'q' to quit): ").strip().lower()
+        if val == 'q':
+            raise SystemExit(0)
+        if val.isdigit():
+            n = int(val)
+            if 1 <= n <= len(items):
+                return items[n-1][0], items[n-1][1], items[n-1][2], items[n-1][3]
+        print("Invalid selection.")
+
+
+def select_quotes_simple(quotes: List[Tuple[str, str]], limit: int) -> Tuple[List[str], List[str]]:
+    print("\nQuotes:")
+    for i, (_, qt) in enumerate(quotes, start=1):
+        text = qt.replace('\n', ' ')
+        print(f" [{i:2d}] {text}")
+    raw = input(f"Enter numbers to GENERATE (comma separated, up to {limit}). Leave blank to cancel: ").strip()
+    if not raw:
+        return [], []
+    picks = []
+    for tok in re.split(r"[,\s]+", raw):
+        if tok.isdigit():
+            n = int(tok)
+            if 1 <= n <= len(quotes):
+                picks.append(n)
+    picks = picks[:limit]
+    gens = [quotes[i-1][0] for i in picks]
+    discs = []
+    return gens, discs
+
+
+def main():
+    load_dotenv()
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        print("DATABASE_URL is not set in environment.")
+        raise SystemExit(1)
+    try:
+        conn = _connect(db_url)
+    except Exception as e:
+        print("Could not connect to database:", e)
+        raise SystemExit(1)
+
+    try:
+        books = list_books(conn)
+        if not books:
+            print("No books with quotes found.")
+            return
+        book_id, title, author, cover_url = pick_from_list(books)
+        images_n = input(f"How many images/quotes to create [{DEFAULT_IMAGES_PER_BOOK}]: ").strip()
+        try:
+            images_n = int(images_n) if images_n else DEFAULT_IMAGES_PER_BOOK
+        except Exception:
+            images_n = DEFAULT_IMAGES_PER_BOOK
+
+        out_dir = os.path.join("prepublish_out", slugify(title))
+        os.makedirs(out_dir, exist_ok=True)
+        run_key = shortkey(book_id)
+
+        quotes = fetch_quotes_for_book(conn, book_id)
+        if not quotes:
+            print("No quotes available for this book.")
+            return
+        gens, discs = select_quotes_simple(quotes, images_n)
+        if not gens and not discs:
+            print("No selection.")
+            return
+        mark_flags(conn, gens, discs)
+
+        # Generate images
+        generated_files = []
+        first_quote_text = None
+        for i, (qid, qtext) in enumerate([(qid, qt) for (qid, qt) in quotes if qid in gens], start=1):
+            fname = f"{slugify(title)}-{run_key}-{i}.png"
+            out_path = os.path.join(out_dir, fname)
+            make_image(qtext, title, author, cover_url, out_path)
+            generated_files.append(out_path)
+            record_generated_image(conn, book_id, qid, run_key, out_path)
+            if first_quote_text is None:
+                first_quote_text = qtext
+
+        # CTA images
+        cta_ig = _pick([
+            "If this resonated, read the next chapter. Link in bio.",
+            "If this stuck with you, turn the page. Link in bio.",
+        ], int(run_key, 16), "ig") or "If this resonated, read the next chapter. Link in bio."
+        cta_fb = _pick([
+            "If this resonated, read the next chapter. Link in post",
+            "If this stuck with you, turn the page. Link in post",
+        ], int(run_key, 16), "fb") or "If this resonated, read the next chapter. Link in post"
+        ig_path = os.path.join(out_dir, f"{slugify(title)}-{run_key}-cta-IG.png")
+        fb_path = os.path.join(out_dir, f"{slugify(title)}-{run_key}-cta-FB.png")
+        make_cta_image(cta_ig, cover_url, ig_path); generated_files.append(ig_path); record_generated_image(conn, book_id, None, run_key, ig_path)
+        make_cta_image(cta_fb, cover_url, fb_path); generated_files.append(fb_path); record_generated_image(conn, book_id, None, run_key, fb_path)
+
+        # Hashtags (basic)
+        hashtags_line = DEFAULT_HASHTAGS
+
+        # Caption file (LLM body or empty)
+        body = generate_caption_body_llm_simple(title, author, out_dir) or ""
+        caption_text = f"{title} - {author}\n{body}\n\n{BRAND_HANDLE} {hashtags_line}".rstrip()
+        caption_path = os.path.join(out_dir, f"{slugify(title)}-{run_key}-caption.txt")
+        with open(caption_path, "w", encoding="utf-8") as f:
+            f.write(caption_text)
+
+        # Print outputs
+        print("\nGenerated files:")
+        for p in generated_files:
+            print(" -", p)
+        print("Caption file:\n -", caption_path)
+        print("\nCaption preview:\n")
+        print(caption_text)
+        if LLM_LAST_OUTPUT:
+            print("\nLLM simple caption body (400-500 chars):\n")
+            print(LLM_LAST_OUTPUT[-1])
+        print("\nDone. Nothing was posted or scheduled. Assets are ready.")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+
+
